@@ -310,7 +310,8 @@ def 站點地圖(資料, 站點編號):
     with solara.Column(classes=["容器", "地圖容器"]):
         solara.Text("YouBike 站點地圖", classes=["容器標題"])
         solara.Text(
-            f"紅色代表可借車 ≤ {門檻.value} 台，藍色代表有車；點擊站點可查看詳細資訊。",
+            "點擊站點可查看詳細資訊；黃色標記為表格中選取的站點。"
+            "顏色依可借車數分級，分級說明見地圖圖例。",
             classes=["說明文字"],
         )
 
@@ -348,6 +349,7 @@ def 站點地圖(資料, 站點編號):
         站點 = gpd.GeoDataFrame(
             地圖表[
                 [
+                    "sno",
                     "站名",
                     "行政區",
                     "狀態",
@@ -385,6 +387,7 @@ def 站點地圖(資料, 站點編號):
             height="520px",
             width="100%",
             basemap="OpenStreetMap",
+            prefer_canvas=True,
         )
         顏色對照 = {
             "0 台": "darkred",
@@ -392,13 +395,26 @@ def 站點地圖(資料, 站點編號):
             "3–5 台": "cadetblue",
             "6 台以上": "darkgreen",
         }
-        分級順序 = list(set(站點["可借車級距"]))
-        地圖.add_marker_cluster(
+        def 站點樣式(圖徵):
+            屬性 = 圖徵["properties"]
+            顏色 = 顏色對照[str(屬性["可借車級距"])]
+            是否選取 = str(屬性["sno"]) == str(站點編號)
+            return {
+                "color": "#111827" if 是否選取 else 顏色,
+                "fillColor": "#facc15" if 是否選取 else 顏色,
+                "fillOpacity": 0.95,
+                "opacity": 1,
+                "weight": 2 if 是否選取 else 1,
+                "radius": 9 if 是否選取 else 5,
+            }
+
+        地圖.add_gdf(
             站點,
-            x="longitude",
-            y="latitude",
-            layer_name="YouBike 站點群聚",
-            popup=[
+            layer_name="YouBike 站點",
+            info_mode="on_click",
+            style_callback=站點樣式,
+            point_style={"radius": 5, "weight": 1, "fillOpacity": 0.95},
+            fields=[
                 "站名",
                 "行政區",
                 "狀態",
@@ -409,11 +425,11 @@ def 站點地圖(資料, 站點編號):
                 "地址",
                 "資料更新時間",
             ],
-            color_column="可借車級距",
-            marker_colors=[顏色對照[級距] for 級距 in 分級順序],
-            icon_names=["bicycle"],
-            add_legend=True,
-            max_cluster_radius=60,
+        )
+        地圖.add_legend(
+            title="可借車分級",
+            legend_dict=顏色對照,
+            position="bottomright",
         )
         圖表重新量寬度.element()
         solara.display(地圖)
