@@ -6,12 +6,15 @@
    （不要用 python：這台電腦的 python 會連到 Anaconda，套件版本不對，圖表會畫不出來）
 """
 
+import html
 import json
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 import geopandas as gpd
+import ipyleaflet
+import ipywidgets
 import ipyvue
 import leafmap
 import pandas as pd
@@ -346,27 +349,6 @@ def 站點地圖(資料, 站點編號):
             solara.Text("目前站點沒有有效座標，無法顯示地圖。", classes=["說明文字"])
             return
 
-        站點 = gpd.GeoDataFrame(
-            地圖表[
-                [
-                    "sno",
-                    "站名",
-                    "行政區",
-                    "狀態",
-                    "可借車級距",
-                    "可借車",
-                    "可還車",
-                    "總車位",
-                    "地址",
-                    "資料更新時間",
-                    "longitude",
-                    "latitude",
-                ]
-            ],
-            geometry=gpd.points_from_xy(地圖表["longitude"], 地圖表["latitude"]),
-            crs="EPSG:4326",
-        ).reset_index(drop=True)
-
         定位站 = 地圖表[地圖表["sno"].astype(str) == str(站點編號)]
         if not 定位站.empty:
             地圖中心 = [
@@ -395,41 +377,87 @@ def 站點地圖(資料, 站點編號):
             "3–5 台": "cadetblue",
             "6 台以上": "darkgreen",
         }
-        def 站點樣式(圖徵):
-            屬性 = 圖徵["properties"]
-            顏色 = 顏色對照[str(屬性["可借車級距"])]
-            是否選取 = str(屬性["sno"]) == str(站點編號)
-            return {
-                "color": "#111827" if 是否選取 else 顏色,
-                "fillColor": "#facc15" if 是否選取 else 顏色,
-                "fillOpacity": 0.95,
-                "opacity": 1,
-                "weight": 2 if 是否選取 else 1,
-                "radius": 9 if 是否選取 else 5,
-            }
 
-        地圖.add_gdf(
-            站點,
-            layer_name="YouBike 站點",
-            info_mode="on_click",
-            style_callback=站點樣式,
-            point_style={"radius": 5, "weight": 1, "fillOpacity": 0.95},
-            fields=[
-                "站名",
-                "行政區",
-                "狀態",
-                "可借車",
-                "可借車級距",
-                "可還車",
-                "總車位",
-                "地址",
-                "資料更新時間",
-            ],
+        def 顯示值(值):
+            if pd.isna(值) or str(值).strip() == "":
+                return "—"
+            return html.escape(str(值))
+
+        標記們 = []
+        for _, 站 in 地圖表.iterrows():
+            站名 = str(站["sna"]).removeprefix("YouBike2.0_")
+            站點級距 = str(站["可借車級距"])
+            顏色 = 顏色對照[站點級距]
+            是否選取 = str(站["sno"]) == str(站點編號)
+            標記顏色 = "#facc15" if 是否選取 else 顏色
+            邊框顏色 = "#111827" if 是否選取 else "#ffffff"
+            圖示 = ipyleaflet.DivIcon(
+                html=(
+                    '<div style="width:14px;height:14px;border:2px solid '
+                    f'{邊框顏色};border-radius:50%;background:{標記顏色};'
+                    'box-sizing:border-box;"></div>'
+                ),
+                icon_size=(14, 14),
+                icon_anchor=(7, 7),
+                class_name="",
+            )
+
+            資訊列 = [
+                ("站名", 站名),
+                ("行政區", 站["行政區"]),
+                ("狀態", 站["狀態"]),
+                ("可借車", f'{站["可借車"]} 台'),
+                ("可借車級距", 站點級距),
+                ("可還車", f'{站["可還車"]} 個'),
+                ("總車位", f'{站["總車位"]} 個'),
+                ("地址", 站["地址"]),
+                ("資料更新時間", 站["資料更新時間"]),
+            ]
+            資訊內容 = "".join(
+                f"<div><strong>{html.escape(欄名)}：</strong>{顯示值(值)}</div>"
+                for 欄名, 值 in 資訊列
+            )
+            標記們.append(
+                ipyleaflet.Marker(
+                    location=(float(站["latitude"]), float(站["longitude"])),
+                    title=站名,
+                    icon=圖示,
+                    popup=ipywidgets.HTML(
+                        value=(
+                            '<div style="min-width:180px;line-height:1.7">'
+                            f"{資訊內容}</div>"
+                        )
+                    ),
+                )
+            )
+
+        地圖.add_layer(
+            ipyleaflet.MarkerCluster(
+                markers=標記們,
+                name="YouBike 站點",
+                show_coverage_on_hover=False,
+                spiderfy_on_max_zoom=True,
+                disable_clustering_at_zoom=17,
+            )
         )
-        地圖.add_legend(
-            title="可借車分級",
-            legend_dict=顏色對照,
-            position="bottomright",
+        圖例列 = "".join(
+            '<div style="display:flex;align-items:center;gap:8px;margin-top:5px">'
+            f'<span style="width:11px;height:11px;border-radius:50%;background:{顏色};'
+            f'flex:none"></span><span>{html.escape(級距)}</span></div>'
+            for 級距, 顏色 in 顏色對照.items()
+        )
+        圖例 = ipywidgets.HTML(
+            value=(
+                '<div style="background:white;padding:10px 12px;border-radius:6px;'
+                'box-shadow:0 1px 5px #0005;color:#111827;font:12px/1.4 sans-serif;'
+                'max-width:190px">'
+                '<strong>可借車分級</strong>'
+                f"{圖例列}</div>"
+            )
+        )
+        圖例.layout.max_width = "190px"
+        地圖.add_control(
+            ipyleaflet.WidgetControl(widget=圖例, position="bottomright")
         )
         圖表重新量寬度.element()
         solara.display(地圖)
