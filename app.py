@@ -6,10 +6,14 @@
    （不要用 python：這台電腦的 python 會連到 Anaconda，套件版本不對，圖表會畫不出來）
 """
 
+import json
+import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 import geopandas as gpd
 import ipyvue
+import leafmap
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -24,6 +28,9 @@ DATA_PATH = Path(__file__).parent / "data" / "03_youbike_snapshots_clean.csv"
 BOUNDARY_PATH = (
     Path(__file__).parent / "data" / "鄉(鎮、市、區)界線1140318" / "TOWN_MOI_1140318.shp"
 )
+即時資料網址 = "https://tcgbusfs.blob.core.windows.net/dotapp/youbike/v2/youbike_immediate.json"
+即時更新秒數 = 60
+即時選項 = "即時"
 
 # 讀檔放在元件外面：App 啟動時只讀一次，切換選項時不會重新讀檔。
 # sno、act 指定為字串，避免被自動轉成整數（W3 的 read_json 陷阱，read_csv 也一樣）。
@@ -58,6 +65,64 @@ def 臺大站對應行政區(資料, 界線):
 是臺大站 = df["sno"].isin(對照.index)
 df.loc[是臺大站, "sarea"] = df.loc[是臺大站, "sno"].map(對照)
 
+
+def 取得即時資料():
+    """從臺北市資料大平臺取得最新的 YouBike 站點資料。"""
+    with urllib.request.urlopen(即時資料網址, timeout=20) as 回應:
+        內容 = json.load(回應)
+
+    if not isinstance(內容, list) or not 內容:
+        raise ValueError("即時資料格式不正確或沒有站點資料。")
+
+    即時表 = pd.DataFrame(內容)
+    必要欄位 = {
+        "sno",
+        "sna",
+        "sarea",
+        "act",
+        "ar",
+        "Quantity",
+        "available_rent_bikes",
+        "available_return_bikes",
+        "latitude",
+        "longitude",
+        "updateTime",
+    }
+    缺少欄位 = 必要欄位 - set(即時表.columns)
+    if 缺少欄位:
+        raise ValueError(f"即時資料缺少必要欄位：{', '.join(sorted(缺少欄位))}")
+
+    即時表["sno"] = 即時表["sno"].astype(str)
+    即時表 = 即時表[即時表["act"].astype(str).str.lower().isin(["1", "true"])].copy()
+    臺大站行政區 = 即時表["sno"].map(對照)
+    有對應行政區 = 臺大站行政區.notna()
+    即時表.loc[有對應行政區, "sarea"] = 臺大站行政區[有對應行政區]
+
+    if 即時表.empty:
+        raise ValueError("即時資料中沒有營運中的站點。")
+    return 即時表
+
+
+def 即時資料更新(停止事件, 啟用):
+    """即時模式下每 60 秒抓取一次資料，並保留最近一次成功結果。"""
+    if not 啟用:
+        return
+
+    最新資料 = None
+    最新更新時間 = None
+    while not 停止事件.is_set():
+        try:
+            最新資料 = 取得即時資料()
+            最新更新時間 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            更新錯誤 = None
+        except (OSError, ValueError) as 錯誤:
+            更新錯誤 = f"{type(錯誤).__name__}: {錯誤}"
+
+        yield 最新資料, 最新更新時間, 更新錯誤
+        if 停止事件.wait(即時更新秒數):
+            break
+
+
 # 防呆：剛好落在界線上、或在界線外的站對不到行政區，維持原本的分區並提醒。
 沒對到 = df.loc[df["sarea"] == "臺大公館校區", "sno"].nunique()
 if 沒對到 > 0:
@@ -68,6 +133,7 @@ if 沒對到 > 0:
 # reactive：值改變時，用到它的元件會自動重新執行。
 門檻 = solara.reactive(0)
 時段 = solara.reactive(時段們[0])
+選取站點 = solara.reactive(None)
 
 # 行政區選單：「全部」看各區比較，選某一區就看該區每個站。
 行政區們 = ["全部"] + sorted(df["sarea"].unique())
@@ -97,7 +163,7 @@ def 某區各站(資料, 區名, 門檻值):
             "ar": "地址",
         }
     )
-    表 = 表[["站名", "狀態", "可借車", "可還車", "總車位", "地址"]]
+    表 = 表[["sno", "站名", "狀態", "可借車", "可還車", "總車位", "地址"]]
     表 = 表.sort_values("可借車").reset_index(drop=True)
     表.index = 表.index + 1  # 編號從 1 開始
     return 表
@@ -125,6 +191,7 @@ def 各區表格(表):
 .v-application, .v-application__wrap, .整頁, .整頁 .v-sheet, .整頁 [class*="v-col"] {
     min-width: 0 !important; }
 .容器 .js-plotly-plot, .容器 .plot-container { max-width: 100%; }
+.地圖容器 .jupyter-widgets, .地圖容器 .leaflet-container { max-width: 100%; min-width: 0; }
 .整頁 { max-width: 1280px; width: 100%; align-self: center; margin: 0 auto; padding: 24px 16px; }
 .容器 { background: white; border: 1px solid #e5e7eb; border-radius: 10px;
         padding: 20px 24px; }
@@ -238,12 +305,133 @@ def 單區各站圖(表, 高度):
 
 
 @solara.component
+def 站點地圖(資料, 站點編號):
+    """依照目前的時段、行政區與空站門檻繪製可點擊的 Leafmap 站點圖。"""
+    with solara.Column(classes=["容器", "地圖容器"]):
+        solara.Text("YouBike 站點地圖", classes=["容器標題"])
+        solara.Text(
+            f"紅色代表可借車 ≤ {門檻.value} 台，藍色代表有車；點擊站點可查看詳細資訊。",
+            classes=["說明文字"],
+        )
+
+        if 資料.empty:
+            solara.Text("目前選取的時段與行政區沒有站點資料。", classes=["說明文字"])
+            return
+
+        地圖表 = 資料.assign(
+            站名=資料["sna"].str.removeprefix("YouBike2.0_"),
+            狀態=(資料["available_rent_bikes"] <= 門檻.value).map(
+                {True: "空站", False: "有車"}
+            ),
+            可借車級距=pd.cut(
+                pd.to_numeric(資料["available_rent_bikes"], errors="coerce"),
+                bins=[-1, 0, 2, 5, float("inf")],
+                labels=["0 台", "1–2 台", "3–5 台", "6 台以上"],
+            ),
+        ).rename(
+            columns={
+                "sarea": "行政區",
+                "available_rent_bikes": "可借車",
+                "available_return_bikes": "可還車",
+                "Quantity": "總車位",
+                "ar": "地址",
+                "updateTime": "資料更新時間",
+            }
+        )
+        地圖表["longitude"] = pd.to_numeric(地圖表["longitude"], errors="coerce")
+        地圖表["latitude"] = pd.to_numeric(地圖表["latitude"], errors="coerce")
+        地圖表 = 地圖表.dropna(subset=["longitude", "latitude"])
+        if 地圖表.empty:
+            solara.Text("目前站點沒有有效座標，無法顯示地圖。", classes=["說明文字"])
+            return
+
+        站點 = gpd.GeoDataFrame(
+            地圖表[
+                [
+                    "站名",
+                    "行政區",
+                    "狀態",
+                    "可借車級距",
+                    "可借車",
+                    "可還車",
+                    "總車位",
+                    "地址",
+                    "資料更新時間",
+                    "longitude",
+                    "latitude",
+                ]
+            ],
+            geometry=gpd.points_from_xy(地圖表["longitude"], 地圖表["latitude"]),
+            crs="EPSG:4326",
+        ).reset_index(drop=True)
+
+        定位站 = 地圖表[地圖表["sno"].astype(str) == str(站點編號)]
+        if not 定位站.empty:
+            地圖中心 = [
+                float(定位站.iloc[0]["latitude"]),
+                float(定位站.iloc[0]["longitude"]),
+            ]
+            縮放層級 = 17
+        else:
+            地圖中心 = [
+                float(地圖表["latitude"].mean()),
+                float(地圖表["longitude"].mean()),
+            ]
+            縮放層級 = 11 if 行政區.value == "全部" else 13
+
+        地圖 = leafmap.Map(
+            center=地圖中心,
+            zoom=縮放層級,
+            height="520px",
+            width="100%",
+            basemap="OpenStreetMap",
+        )
+        顏色對照 = {
+            "0 台": "darkred",
+            "1–2 台": "orange",
+            "3–5 台": "cadetblue",
+            "6 台以上": "darkgreen",
+        }
+        分級順序 = list(set(站點["可借車級距"]))
+        地圖.add_marker_cluster(
+            站點,
+            x="longitude",
+            y="latitude",
+            layer_name="YouBike 站點群聚",
+            popup=[
+                "站名",
+                "行政區",
+                "狀態",
+                "可借車",
+                "可借車級距",
+                "可還車",
+                "總車位",
+                "地址",
+                "資料更新時間",
+            ],
+            color_column="可借車級距",
+            marker_colors=[顏色對照[級距] for 級距 in 分級順序],
+            icon_names=["bicycle"],
+            add_legend=True,
+            max_cluster_radius=60,
+        )
+        圖表重新量寬度.element()
+        solara.display(地圖)
+
+
+@solara.component
 def Page():
     solara.Title("YouBike 空站觀察")
     solara.Style(頁面樣式)
 
-    當時 = df[df["時段"] == 時段.value]
-    各區表 = 各區空站比例(當時, 門檻.value)
+    即時模式 = 時段.value == 即時選項
+    即時結果 = solara.use_thread(
+        lambda 停止事件: 即時資料更新(停止事件, 即時模式),
+        dependencies=[即時模式],
+    )
+    即時資料, 即時更新時間, 即時錯誤 = 即時結果.value or (None, None, None)
+    if 即時結果.error is not None:
+        即時錯誤 = f"{type(即時結果.error).__name__}: {即時結果.error}"
 
     with solara.Column(classes=["整頁"], gap="16px"):
         # ---------- 容器 1：標題 ----------
@@ -255,7 +443,7 @@ def Page():
         with solara.Column(classes=["容器"], gap="8px"):
             # 寬螢幕兩個選單並排（各佔 6/12），手機上下排（各佔 12/12）。
             with solara.ColumnsResponsive(12, small=[6, 6]):
-                solara.Select(label="時段", value=時段, values=時段們)
+                solara.Select(label="時段", value=時段, values=[即時選項] + 時段們)
                 solara.Select(label="行政區", value=行政區, values=行政區們)
             solara.SliderInt("空站門檻：可借車 ≤", value=門檻, min=0, max=5)
             solara.Text(
@@ -263,18 +451,54 @@ def Page():
                 classes=["說明文字"],
             )
 
-        # ---------- 容器 3：表格；容器 4：長條圖 ----------
-        if 行政區.value == "全部":
-            內容_全部(各區表)
+        if 即時模式 and 即時資料 is None:
+            with solara.Column(classes=["容器"]):
+                if 即時錯誤:
+                    solara.Text(f"即時資料更新失敗：{即時錯誤}", classes=["說明文字"])
+                    solara.Button("重新取得即時資料", on_click=即時結果.retry)
+                else:
+                    solara.Text("正在取得 YouBike 即時站點資料……", classes=["說明文字"])
         else:
-            內容_單區(當時, 各區表)
+            當時 = 即時資料 if 即時模式 else df[df["時段"] == 時段.value]
+            各區表 = 各區空站比例(當時, 門檻.value)
+            地圖資料 = (
+                當時
+                if 行政區.value == "全部"
+                else 當時[當時["sarea"] == 行政區.value]
+            )
+            站點地圖(地圖資料, 選取站點.value)
+
+            if 即時錯誤:
+                with solara.Column(classes=["容器"]):
+                    solara.Text(
+                        f"即時資料更新失敗，地圖保留最近一次成功資料：{即時錯誤}",
+                        classes=["說明文字"],
+                    )
+                    solara.Button("重新取得即時資料", on_click=即時結果.retry)
+
+            # ---------- 容器 3：表格；容器 4：長條圖 ----------
+            if 行政區.value != "全部" and 行政區.value not in 各區表["sarea"].values:
+                with solara.Column(classes=["容器"]):
+                    solara.Text("目前資料中沒有這個行政區的營運站點。", classes=["說明文字"])
+            elif 行政區.value == "全部":
+                內容_全部(各區表)
+            else:
+                內容_單區(當時, 各區表)
 
         # ---------- 容器 5：頁尾（資料來源） ----------
         with solara.Column(classes=["容器", "頁尾"], gap="0px"):
-            solara.Text(
-                "資料來源：臺北市 YouBike 2.0 即時資料（臺北市資料大平臺），"
-                f"依政府資料開放授權條款第 1 版使用。資料時間：{時段.value}。"
-            )
+            if 即時模式:
+                資料時間 = 即時更新時間 or "等待首次更新"
+                solara.Text(
+                    "資料來源：臺北市 YouBike 2.0 即時資料（臺北市資料大平臺），"
+                    f"依政府資料開放授權條款第 1 版使用。最近成功抓取時間：{資料時間}；"
+                    f"每 {即時更新秒數} 秒更新一次。"
+                )
+            else:
+                solara.Text(
+                    "資料來源：臺北市 YouBike 2.0 即時資料（臺北市資料大平臺），"
+                    f"依政府資料開放授權條款第 1 版使用。資料時間：{時段.value}。"
+                )
             solara.Text(
                 "行政區界線：內政部國土測繪中心「鄉鎮市區界線（TWD97 經緯度）」，"
                 "依政府資料開放授權條款第 1 版使用。「臺大公館校區」的站已依經緯度歸入所在行政區。"
@@ -307,11 +531,32 @@ def 內容_單區(當時, 各區表):
     with solara.Column(classes=["容器"]):
         solara.Text(f"{行政區.value}各站明細（{時段.value}）", classes=["容器標題"])
         solara.Text(
+            "在站點資料列的任一欄位按 ⋮，選「地圖定位」即可跳到該站。",
+            classes=["說明文字"],
+        )
+        solara.Text(
             f"營運中 {len(站表)} 站，空站 {空站數} 站（{空站數 / len(站表):.1%}），"
             f"空站比例在全市 {len(各區表)} 區中排第 {排名}。",
             classes=["說明文字"],
         )
-        solara.DataFrame(站表, items_per_page=10)
+        表格欄位 = [欄位 for 欄位 in 站表.columns if 欄位 != "sno"]
+
+        def 地圖定位(欄位, 列號):
+            if 欄位 not in 表格欄位:
+                raise ValueError(f"無法定位表格欄位：{欄位}")
+            選取站點.value = str(站表.loc[int(列號), "sno"])
+
+        solara.DataFrame(
+            站表[表格欄位],
+            items_per_page=10,
+            cell_actions=[
+                solara.CellAction(
+                    name="地圖定位",
+                    icon="mdi-map-marker",
+                    on_click=地圖定位,
+                )
+            ],
+        )
 
     with solara.Column(classes=["容器"]):
         圖表重新量寬度.element()
